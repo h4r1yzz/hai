@@ -1,0 +1,1300 @@
+SET SCHEMA 'public';
+
+
+-- =============================================
+-- Author:      Sengwei
+-- Create date: 19/2/2024
+-- Description: Housekeeping CIMS Poller
+-- =============================================
+CREATE PROCEDURE cs_sp_cims_housekeeping( 
+    table_name VARCHAR(256),
+    expiration_date TIMESTAMP,
+    biz_date TIMESTAMP,
+    batch_housekeep_record INT,
+    OUT batch_success_record INT
+) AS $$
+DECLARE
+    error_message VARCHAR(256);
+BEGIN
+    -- Initialize batch_success_record
+    batch_success_record := 0;
+
+    -- Using a CASE statement for better structure
+    CASE table_name
+        WHEN 'CIMS_CUSTOMER_SERVICE_HISTORY' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_customer_service_history
+                WHERE biz_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_MOBILE_BOOKING_ALERT_HISTORY' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_mobile_booking_alert_history mba
+                USING cims_mobile_booking_history mb
+                WHERE mba.booking_number = mb.booking_number
+                AND mb.expiry_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_MOBILE_BOOKING_HISTORY' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_mobile_booking_history
+                WHERE expiry_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_SEQ_DETAIL' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_seq_detail
+                WHERE bizdate < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_SERVICE_TICKET_HISTORY' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_service_ticket_history
+                WHERE date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_VISIT_HISTORY' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_visit_history
+                WHERE visit_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'DW_PROC_TRX_SPD_H' THEN
+            WITH deleted_rows AS (
+                DELETE FROM dw_proc_trx_spd_h
+                WHERE date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'DW_QUEUE_TRX_DETAIL_H' THEN
+            WITH deleted_rows AS (
+                DELETE FROM dw_queue_trx_detail_h
+                WHERE visit_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'KIOSK_HEARTBEAT_H' THEN
+            WITH deleted_rows AS (
+                DELETE FROM kiosk_heartbeat_h
+                WHERE heartbeat_time < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        WHEN 'CIMS_ACTION_LOG_H' THEN
+            WITH deleted_rows AS (
+                DELETE FROM cims_action_log_h
+                WHERE last_updated_date < expiration_date
+                RETURNING *
+            )
+            SELECT COUNT(*) INTO batch_success_record FROM deleted_rows;
+
+        ELSE
+            RAISE EXCEPTION 'Invalid table name: %', table_name;
+    END CASE;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        error_message := SQLERRM;  -- Get the error message
+        
+        RAISE NOTICE 'Error on housekeeping transactions: %', error_message;
+
+        INSERT INTO mvdb_sbc_nts_journal.cs_journal(
+            tran_date, activity, status, wks_id, event_name,
+            class_name, before_image, after_image, remarks,
+            next_override_level, channel_id, subsystem_code,
+            user_name, override_username, view_name
+        ) VALUES (
+            NOW(), 7, 1, NULL, 'CIMS SP HOUSEKEEPING',
+            NULL, NULL, NULL, error_message,
+            NULL, NULL, 'BASE', 'SYSTEM', NULL, NULL
+        );
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+
+
+
+
+
+
+-- =============================================
+-- Author:      Xu Kai
+-- Create date: 02/11/2023
+-- Description: Kiosk Ticket Retrieval
+-- =============================================
+
+CREATE PROCEDURE CS_SP_KIOSK_TICKET_RETRIEVAL ( 
+    p_ticket_code VARCHAR(20),
+    p_channel_code VARCHAR(20),
+    p_org_code VARCHAR(20),
+    p_segment VARCHAR(20),
+    p_queue_Code VARCHAR(20), 
+    OUT cur REFCURSOR, 
+    OUT cur2 REFCURSOR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_TICKET_TYPE VARCHAR(2);
+    v_CA_ROLE VARCHAR(20);
+    v_CurrentTicketNo VARCHAR(10);
+BEGIN
+    -- Get CA_ROLE from configuration
+    SELECT SYSTEM_VALUE INTO v_CA_ROLE 
+    FROM MVDB_CIMS_CONFIG.CIMS_SYSTEM_CONFIG 
+    WHERE SYSTEM_CODE = 'CA_ROLE' 
+    LIMIT 1;
+
+    -- Determine TICKET_TYPE
+    v_TICKET_TYPE := (CASE 
+                        WHEN COALESCE(p_queue_Code, '') = '' THEN 'C' 
+                        ELSE CASE 
+                            WHEN EXISTS(SELECT ID 
+                                         FROM MVDB_CIMS_CONFIG.ROLE_QUEUE 
+                                         WHERE QUEUE_CODE = p_queue_Code 
+                                         AND ROLE_CODE = v_CA_ROLE) 
+                            THEN 'C' 
+                            ELSE 'T' 
+                        END 
+                    END);
+
+    -- Create temporary table to hold output ticket
+    CREATE TEMPORARY TABLE tmp_OutputTicket (CURRENT_TICKET_NO VARCHAR(10));
+
+    -- Check if the current ticket exists
+    IF EXISTS (SELECT * 
+               FROM CIMS_SERVICE_TICKET 
+               WHERE TO_TIMESTAMP(DATE, 120) = TO_TIMESTAMP(NOW(), 120)
+               AND ORG_CODE = p_org_code 
+               AND SEGMENT = p_segment 
+               AND ticket_type = v_TICKET_TYPE) THEN
+        
+        -- Update the current ticket number and retrieve it
+        UPDATE CIMS_SERVICE_TICKET 
+        SET CURRENT_TICKET_NO = RIGHT(REPLICATE('0', 3) || (CAST(CURRENT_TICKET_NO AS bigint) + 1)::TEXT, 3)
+        WHERE TO_TIMESTAMP(DATE, 120) = TO_TIMESTAMP(NOW(), 120)
+        AND ORG_CODE = p_org_code 
+        AND SEGMENT = p_segment 
+        AND TICKET_TYPE = v_TICKET_TYPE
+        RETURNING CURRENT_TICKET_NO INTO v_CurrentTicketNo;
+
+    ELSE
+        -- Insert a new ticket and retrieve the ticket number
+        INSERT INTO CIMS_SERVICE_TICKET (TICKET_CODE, CURRENT_TICKET_NO, SEGMENT, DATE, ORG_CODE, CHANNEL_CODE, TICKET_TYPE)
+        VALUES (p_ticket_code, '001', p_segment, NOW(), p_org_code, p_channel_code, v_TICKET_TYPE)
+        RETURNING CURRENT_TICKET_NO INTO v_CurrentTicketNo;
+    END IF;
+
+    -- Store the result in the temporary table
+    INSERT INTO tmp_OutputTicket (CURRENT_TICKET_NO) VALUES (v_CurrentTicketNo);
+
+    -- Open the cursor for the result
+    OPEN cur FOR 
+        SELECT CONCAT((CASE WHEN p_channel_code = 'ONLINE' THEN 'O' ELSE 'B' END),
+                      p_segment, v_TICKET_TYPE, (SELECT CURRENT_TICKET_NO FROM tmp_OutputTicket LIMIT 1)) AS RESULT;
+
+    -- Exception handling
+EXCEPTION WHEN OTHERS THEN
+    -- Rollback logic if needed
+    ROLLBACK;  -- If you were using a transaction
+    -- Output the error message
+    RAISE NOTICE 'Error: %', SQLERRM; -- This will log the error message
+END;
+$$;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- =============================================
+-- Author:		Sandy
+-- Create date: 9/8/2022
+-- Description:	Rollover CIMS Poller
+-- MODIFIED 20230724 xukai : ADDED TO CLOSE ALL COUNTER EOD
+-- MODIFIED 20230811 kaisung : FIX HOUSEKEEPING DW_PROC_TRX_SPD_H AND DW_QUEUE_TRX_DETAIL_H
+-- MODIFIED 20231031 sengwei : SET APPOINTMENT STATUS TO EXPIRED IF CUST NO COME ON THAT DAY
+-- MODIFIED 20231110 sandy : ADDED CAST FOR ALL DATE CHECKING
+-- MODIFIED 20240117 hanrong : Rearrange the sequences of the flows
+-- MODIFIED 20240219 sengwei : remove housekeeping process
+-- MODIFIED 20240226 sengwei : FIX RolloverCIMS_DB timeout issue
+-- =============================================
+
+SET SCHEMA 'public';
+
+CREATE OR REPLACE PROCEDURE CS_SP_ROLLOVER_CIMS (
+    p_p_bizDate TIMESTAMP(3),
+    p_batch_rollover_record INT,
+    p_batch_success_record INOUT INT
+) AS $$
+DECLARE
+    v_TABLE_NAME VARCHAR(128);
+    v_Rollover_Table_Count INT = 0;
+    v_Rollover_Index INT = 0;
+    v_Err TEXT;  -- Use TEXT for error messages in PostgreSQL
+    v_TRANSACTION VARCHAR(20);
+    v_ROLLOVER_PERIOD INT;
+BEGIN
+    v_TRANSACTION := 'ROLLOVER CIMS';
+
+    SELECT SYSTEM_VALUE INTO v_ROLLOVER_PERIOD
+    FROM MVDB_SBC_CIMS_CONFIG.CIMS_SYSTEM_CONFIG
+    WHERE SYSTEM_CODE = 'ROLLOVER_PERIOD';
+
+    IF v_ROLLOVER_PERIOD > 0 THEN
+        v_ROLLOVER_PERIOD := 0 - v_ROLLOVER_PERIOD;
+    END IF;
+
+    p_batch_success_record := 0;
+
+    IF p_batch_rollover_record IS NULL OR p_batch_rollover_record < 1 THEN
+        RAISE EXCEPTION '@batch_rollover_record is NULL or LESS THAN 1.';
+        RETURN;
+    END IF;
+
+    SELECT COUNT(*) INTO v_Rollover_Table_Count
+    FROM CIMS_TABLE_ROLLOVER_SEQ
+    WHERE TABLE_TYPE = 'CIMS_SERIES';
+
+    WHILE v_Rollover_Index < v_Rollover_Table_Count LOOP
+
+        SELECT TABLE_NAME INTO v_TABLE_NAME
+        FROM CIMS_TABLE_ROLLOVER_SEQ
+        WHERE TABLE_TYPE = 'CIMS_SERIES'
+        ORDER BY SEQ DESC OFFSET v_Rollover_Index LIMIT 1;
+
+        RAISE NOTICE '%', CONCAT('START Rollovering for ', v_TABLE_NAME);
+
+        IF v_TABLE_NAME = 'CIMS_CUSTOMER_SERVICE' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+            
+            -- Insert the rows into the history table
+            INSERT INTO CIMS_CUSTOMER_SERVICE_HISTORY
+            SELECT * FROM CIMS_CUSTOMER_SERVICE
+            WHERE CAST(biz_date AS DATE) <= CAST(p_p_bizDate AS DATE)
+            LIMIT p_batch_rollover_record;
+
+            -- Delete the rows using a CTE
+            WITH del AS (
+                SELECT ctid FROM CIMS_CUSTOMER_SERVICE
+                WHERE CAST(biz_date AS DATE) <= CAST(p_p_bizDate AS DATE)
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_CUSTOMER_SERVICE WHERE ctid IN (SELECT ctid FROM del);
+            
+            p_batch_success_record := p_batch_success_record + FOUND;
+
+        ELSIF v_TABLE_NAME = 'CIMS_SERVICE_TICKET' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+
+            INSERT INTO CIMS_SERVICE_TICKET_HISTORY
+            SELECT * FROM CIMS_SERVICE_TICKET
+            WHERE CAST(DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+            LIMIT p_batch_rollover_record;
+
+            WITH del AS (
+                SELECT ctid FROM CIMS_SERVICE_TICKET
+                WHERE CAST(DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_SERVICE_TICKET WHERE ctid IN (SELECT ctid FROM del);
+
+        ELSIF v_TABLE_NAME = 'CIMS_MOBILE_BOOKING_ALERT' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+
+            INSERT INTO CIMS_MOBILE_BOOKING_ALERT_HISTORY
+            SELECT mba.*
+            FROM CIMS_MOBILE_BOOKING_ALERT mba
+            INNER JOIN CIMS_MOBILE_BOOKING mb ON mba.BOOKING_NUMBER = mb.BOOKING_NUMBER
+            WHERE CAST(mb.expiry_date AS DATE) <= CAST(p_p_bizDate AS DATE) OR mb.appointment_status = 2
+            LIMIT p_batch_rollover_record;
+
+            WITH del AS (
+                SELECT mba.ctid
+                FROM CIMS_MOBILE_BOOKING_ALERT mba
+                INNER JOIN CIMS_MOBILE_BOOKING mb ON mba.BOOKING_NUMBER = mb.BOOKING_NUMBER
+                WHERE CAST(mb.expiry_date AS DATE) <= CAST(p_p_bizDate AS DATE) OR mb.appointment_status = 2
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_MOBILE_BOOKING_ALERT WHERE ctid IN (SELECT ctid FROM del);
+
+        ELSIF v_TABLE_NAME = 'CIMS_MOBILE_BOOKING' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+
+            INSERT INTO CIMS_MOBILE_BOOKING_HISTORY
+            SELECT * FROM CIMS_MOBILE_BOOKING
+            WHERE CAST(expiry_date AS DATE) <= CAST(p_p_bizDate AS DATE) OR appointment_status = 2
+            LIMIT p_batch_rollover_record;
+
+            WITH del AS (
+                SELECT ctid FROM CIMS_MOBILE_BOOKING
+                WHERE CAST(expiry_date AS DATE) <= CAST(p_p_bizDate AS DATE) OR appointment_status = 2
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_MOBILE_BOOKING WHERE ctid IN (SELECT ctid FROM del);
+
+        ELSIF v_TABLE_NAME = 'CIMS_VISIT' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+
+            INSERT INTO CIMS_VISIT_HISTORY
+            SELECT * FROM CIMS_VISIT
+            WHERE CAST(VISIT_DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+            LIMIT p_batch_rollover_record;
+
+            WITH del AS (
+                SELECT ctid FROM CIMS_VISIT
+                WHERE CAST(VISIT_DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_VISIT WHERE ctid IN (SELECT ctid FROM del);
+
+        ELSIF v_TABLE_NAME = 'CIMS_ACTION_LOG' THEN
+            RAISE NOTICE '%', v_TABLE_NAME;
+
+            INSERT INTO CIMS_ACTION_LOG_H
+            SELECT * FROM CIMS_ACTION_LOG
+            WHERE CAST(LAST_UPDATED_DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+            LIMIT p_batch_rollover_record;
+
+            WITH del AS (
+                SELECT ctid FROM CIMS_ACTION_LOG
+                WHERE CAST(LAST_UPDATED_DATE AS DATE) <= CAST(p_p_bizDate AS DATE)
+                LIMIT p_batch_rollover_record
+            )
+            DELETE FROM CIMS_ACTION_LOG WHERE ctid IN (SELECT ctid FROM del);
+
+        -- Repeat the same pattern for the remaining tables
+
+        ELSE
+            RAISE NOTICE '%', CONCAT('NO ROLLOVER RECORD FOUND FOR TABLE ', v_TABLE_NAME);
+        END IF;
+
+        RAISE NOTICE '%', CONCAT('END Rollovering for ', v_TABLE_NAME);
+        v_Rollover_Index := v_Rollover_Index + 1;
+    END LOOP;
+
+    UPDATE MVDB_SBC_CIMS_CONFIG.COUNTER SET COUNTER_STATUS = 2;
+
+    UPDATE MVDB_SBC_CIMS.CIMS_MOBILE_BOOKING 
+    SET APPOINTMENT_STATUS = -1 
+    WHERE CAST(ARRIVING_DATE AS DATE) = CAST(NOW() - 1 AS DATE) AND APPOINTMENT_STATUS = 1;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        v_Err := SQLERRM();
+        INSERT INTO MVDB_SBC_NTS_JOURNAL.CS_JOURNAL(
+            TRAN_DATE, ACTIVITY, STATUS, WKS_ID, EVENT_NAME, CLASS_NAME, 
+            BEFORE_IMAGE, AFTER_IMAGE, REMARKS, NEXT_OVERRIDE_LEVEL, 
+            CHANNEL_ID, SUBSYSTEM_CODE, USER_NAME, OVERRIDE_USERNAME, VIEW_NAME)
+        VALUES(
+            NOW(), 7, 1, NULL, 'ROLLOVER CIMS', NULL, NULL, NULL, v_Err, 
+            NULL, NULL, 'BASE', 'SYSTEM', NULL, NULL
+        );
+
+        RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- ==========================================================================
+-- Author:		HongYang
+-- Create date: 29/11/2021
+-- Description:	cims dashboard 
+-- Updates / Notes:
+-- 20230302, SimBee : Rearrange order as displayed
+--		box_type format: <order><ticketType><status><gridUse><segment-booking>
+-- 20230818, ZiJian : Rearrange order
+-- 20230822, HanRong : Change GOLD to Gold, WEALTH to Wealth for Premium Queue Pending
+-- 20231123, SimBee : Exclude count for appointment pass arriving date and time
+-- 20231124, SengWei : Change arriving time to expiry date at Online Appointment count value 
+-- ==========================================================================
+
+CREATE OR REPLACE PROCEDURE SP_CIMS_DASHBOARD ( 
+p_branchCode varchar(100),
+p_date varchar(100),
+p_isCounterOpen smallint,
+p_counterCode varchar(100),
+p_isBranch smallint, IN OUT cur REFCURSOR)
+AS $$ 
+DECLARE v_exceedTime TIMESTAMP(3) 
+	; v_heartbeatTime TIMESTAMP(3)
+	; v_FORMAT_AMT varchar(10) = '#,0.00';
+BEGIN
+ v_exceedTime := -(CAST((SELECT TAG1 FROM CIMS_PICKLIST WHERE CATEGORY = 'EXP_WAIT_TIME') AS INT)) * INTERVAL '1 minute' + NOW()
+		; v_heartbeatTime := -(CAST((SELECT TAG1 FROM CIMS_PICKLIST WHERE CATEGORY = 'EXP_KIOSK_ACTIVE') AS INT)) * INTERVAL '1 minute' + NOW()
+		; p_branchCode := COALESCE(p_branchCode, '');
+
+CREATE TEMPORARY TABLE tmpOrgCod ( CODE varchar(40));
+IF(p_isBranch = 1) THEN
+	INSERT INTO tmpOrgCod SELECT Value FROM STRING_SPLIT(p_branchCode, ' ')
+ LIMIT 1;
+ELSE 
+	INSERT INTO tmpOrgCod SELECT Value FROM STRING_SPLIT(p_branchCode, ' ');
+END IF;
+
+
+CREATE TEMPORARY TABLE tmpTblCompileCust AS
+SELECT SERVICE_STATUS, SEGMENT, '' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+	GROUP BY SERVICE_STATUS, SEGMENT;
+INSERT INTO tmpTblCompileCust
+SELECT SERVICE_STATUS, SEGMENT, '' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE_HISTORY
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+	GROUP BY SERVICE_STATUS, SEGMENT;
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpTblCompileCust
+SELECT SERVICE_STATUS, SEGMENT, 'T' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+		AND ORIGINAL_SERVICE_STATUS = 5 AND (p_counterCode = '' OR COUNTER_CODE = p_counterCode)
+	GROUP BY SERVICE_STATUS, SEGMENT;
+INSERT INTO tmpTblCompileCust
+SELECT SERVICE_STATUS, SEGMENT, 'T' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE_HISTORY
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+		AND ORIGINAL_SERVICE_STATUS = 5 AND (p_counterCode = '' OR COUNTER_CODE = p_counterCode)
+	GROUP BY SERVICE_STATUS, SEGMENT; 
+	END IF;
+INSERT INTO tmpTblCompileCust
+SELECT SERVICE_STATUS, SEGMENT, 'E' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+		AND SERVICE_STATUS = 1 AND VISIT_TIME < v_exceedTime
+	GROUP BY SERVICE_STATUS, SEGMENT;
+INSERT INTO tmpTblCompileCust
+SELECT SERVICE_STATUS, SEGMENT, 'E' as SPECIAL, count(*) as COUNT FROM CIMS_CUSTOMER_SERVICE_HISTORY
+	WHERE CAST(BIZ_DATE AS Date) = CAST(p_date AS Date) AND (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod))
+		AND SERVICE_STATUS = 1 AND VISIT_TIME < v_exceedTime
+	GROUP BY SERVICE_STATUS, SEGMENT;
+
+CREATE TEMPORARY TABLE tmpResult (name varchar(150), box_type varchar(10), count_value varchar(30));
+
+IF (p_isBranch = 0) THEN
+INSERT INTO tmpResult
+	select 'Kiosk Status' AS name, '0H0' AS box_type,  '' As count_value
+		UNION
+	select 'Active' AS name, '0H11' AS box_type, COUNT(*) AS count_value
+		from (select ORG_CODE from KIOSK_HEARTBEAT WHERE (p_branchCode = '' OR ORG_CODE in (select CODE from tmpOrgCod)) AND HEARTBEAT_TIME >= v_heartbeatTime
+			group by  ORG_CODE) a
+		UNION
+	select 'Inactive' AS name, '0H21' AS box_type, COUNT(*) AS count_value
+		from (select k.ORG_CODE from (select ORG_CODE, KEY_ from KIOSK_HEARTBEAT WHERE HEARTBEAT_TIME >= v_heartbeatTime group by ORG_CODE, KEY_) h 
+			right join MVDB_SBC_CIMS_CONFIG.KIOSK k ON H.ORG_CODE = k.ORG_CODE and h.KEY_ = k.KEY_
+			WHERE (p_branchCode = '' OR h.ORG_CODE in (select CODE from tmpOrgCod) OR k.ORG_CODE in (select CODE from tmpOrgCod)) 
+				AND h.ORG_CODE is null
+			group by  k.ORG_CODE) a;
+END IF;
+
+
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpResult
+	select 'Total Served' AS name, '5C0' AS box_type,  '' As count_value
+		UNION
+	select 'Served' AS name, '5C31' AS box_type, TO_CHAR(coalesce(sum(COUNT),  0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 3 AND SPECIAL in ('');
+END IF;
+		
+
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpResult
+ 	/* SQLINES DEMO *** 220829 Hong Yang */	
+	select 'Total Skipped Ticket' AS name, '6C0' AS box_type, '' As count_value
+		UNION
+	select 'Skipped Ticket' AS name, '6C42' AS box_type, TO_CHAR(coalesce(sum(COUNT),  0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 4 AND SPECIAL in ('');
+END IF;
+		
+
+INSERT INTO tmpResult
+	/* SQLINES DEMO *** ing exceeded expected time 20220829 Hong Yang */	
+	select 'Ticket waiting exceeded expected time' AS name, '8E0' AS box_type, '' As count_value
+		UNION
+	select 'Ticket waiting Customer' AS name, '8E12' AS box_type, TO_CHAR(coalesce(sum(COUNT), 0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 1 AND SPECIAL in ('E');
+		
+
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpResult
+	 select Case WHEN p_isBranch =1 THEN 'Ticket Transferred to current counter' ELSE 'Ticket Transferred' END AS name, '7T0' AS box_type
+		, '' As count_value
+		UNION
+	select Case WHEN p_isCounterOpen = 0 AND p_isBranch = 1 THEN 'Counter is Closed' ELSE 'Details' END AS name, '7T11' AS box_type
+		, TO_CHAR(coalesce(sum(Case WHEN (p_isCounterOpen = 1 AND p_isBranch = 1) OR p_isBranch = 0 THEN COUNT
+			WHEN p_isCounterOpen = 0 AND p_isBranch = 1 THEN '0' ELSE'0' END), 0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 1 AND SPECIAL in ('T');
+END IF;
+		
+
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpResult
+	select 'Premium Queue Pending' AS name, '2C0' AS box_type, '' As count_value
+		UNION
+	select 'Wealth' AS name, '2W12' AS box_type, TO_CHAR(coalesce(sum(COUNT), 0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 1 AND SPECIAL in ('') AND SEGMENT = 'W'
+		UNION
+	select 'Gold' AS name, '2G12' AS box_type, TO_CHAR(coalesce(sum(COUNT), 0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 1 AND SPECIAL in ('') AND SEGMENT = 'G';
+END IF;
+		
+
+IF (p_isBranch = 1) THEN
+INSERT INTO tmpResult
+	select 'Queue Details' AS name, '1C0' AS box_type, '' As count_value
+		UNION
+	select 'Serving' AS name, '1C21' AS box_type, TO_CHAR(coalesce(sum(COUNT),  0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 2 AND SPECIAL in ('')
+		UNION
+	select 'Pending' AS name, '1C12' AS box_type, TO_CHAR(coalesce(sum(COUNT),  0), '0') AS count_value
+		from tmpTblCompileCust where SERVICE_STATUS = 1 AND SPECIAL in ('');
+END IF;
+		
+INSERT INTO tmpResult
+	select 'Premium Customer Appointment Pending' AS name, '3M0' AS box_type, TO_CHAR(COALESCE(SUM(a.AMOUNT), 0), v_FORMAT_AMT) AS count_value
+		from CIMS_MOBILE_BOOKING b
+			inner join CIMS_MOBILE_BOOKING_ALERT a on b.BOOKING_NUMBER = a.BOOKING_NUMBER
+			WHERE b.APPOINTMENT_STATUS = 1 AND b.SEGMENT in ('G', 'W') AND (p_branchCode = '' OR b.EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod))
+				AND b.ARRIVING_DATE = CAST(p_date AS Date) and CAST(b.EXPIRY_DATE AS time(6)) > cast(now() as time(6))
+		UNION
+	select 'Gold' AS name, '3M10G' AS box_type, TO_CHAR(
+		(SELECT COUNT(*) as total FROM CIMS_MOBILE_BOOKING WHERE APPOINTMENT_STATUS = 1 AND SEGMENT = 'G' AND (p_branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+			AND ARRIVING_DATE = CAST(p_date AS Date) and CAST(EXPIRY_DATE AS time(6)) > cast(now() as time(6)))
+		-- SQLINES DEMO ***  as total  FROM CIMS_MOBILE_BOOKING_HISTORY WHERE APPOINTMENT_STATUS = 1  AND SEGMENT = 'G' AND (@branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from #tmpOrgCod)) 
+		-- SQLINES DEMO ***  = CAST(@date AS Date)) 
+		 , '0') AS count_value
+		UNION
+	select 'Wealth' AS name, '3M10W' AS box_type, TO_CHAR(
+		(SELECT COUNT(*) as total FROM CIMS_MOBILE_BOOKING WHERE APPOINTMENT_STATUS = 1  AND SEGMENT = 'W' AND (p_branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+			AND ARRIVING_DATE = CAST(p_date AS Date) and CAST(EXPIRY_DATE AS time(6)) > cast(now() as time(6)))
+		-- SQLINES DEMO ***  as total  FROM CIMS_MOBILE_BOOKING_HISTORY WHERE APPOINTMENT_STATUS = 1  AND SEGMENT = 'W' AND (@branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from #tmpOrgCod)) 
+		-- SQLINES DEMO ***  = CAST(@date AS Date))
+		 , '0') AS count_value;
+		
+
+INSERT INTO tmpResult
+	select 'Online Booking Appointment' AS name, '4M0' AS box_type, TO_CHAR(COALESCE(SUM(a.AMOUNT), 0), v_FORMAT_AMT) AS count_value
+		from CIMS_MOBILE_BOOKING b
+			inner join CIMS_MOBILE_BOOKING_ALERT a on b.BOOKING_NUMBER = a.BOOKING_NUMBER
+			WHERE b.APPOINTMENT_STATUS = 1 AND (p_branchCode = '' OR b.EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+				AND b.ARRIVING_DATE = CAST(p_date AS Date) 
+		UNION
+	select 'Pending' AS name, '4M10' AS box_type, TO_CHAR(
+		(SELECT COUNT(*) as total FROM CIMS_MOBILE_BOOKING WHERE APPOINTMENT_STATUS = 1  AND (p_branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+			AND ARRIVING_DATE = CAST(p_date AS Date) and CAST(EXPIRY_DATE AS time(6)) > cast(now() as time(6)))
+		-- SQLINES DEMO ***  as total  FROM CIMS_MOBILE_BOOKING_HISTORY WHERE APPOINTMENT_STATUS = 1  AND (@branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from #tmpOrgCod)) 
+		-- SQLINES DEMO ***  = CAST(@date AS Date) and CAST(ARRIVING_TIME AS time) > cast(getdate() as time))
+		, '0') AS count_value
+		UNION
+	select 'Served' AS name, '4M20' AS box_type, TO_CHAR(
+		(SELECT COUNT(*) as total FROM CIMS_MOBILE_BOOKING WHERE APPOINTMENT_STATUS = 2  AND (p_branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+			AND ARRIVING_DATE = CAST(p_date AS Date))
+		+ (SELECT COUNT(*) as total  FROM CIMS_MOBILE_BOOKING_HISTORY WHERE APPOINTMENT_STATUS = 2  AND (p_branchCode = '' OR EXPECTING_ORG_CODE  in (select CODE from tmpOrgCod)) 
+			AND ARRIVING_DATE = CAST(p_date AS Date) )
+		, '0') AS count_value;
+	
+DROP TABLE tmpOrgCod;
+DROP TABLE tmpTblCompileCust;
+
+OPEN cur FOR SELECT * FROM tmpResult;
+DROP TABLE tmpResult;
+
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+
+
+
+
+
+
+
+
+CREATE PROCEDURE SP_DW_PROC_TRX_SPD_TEMP(
+    p_date TIMESTAMPTZ,
+    p_branchCode VARCHAR(100),
+    p_reportName VARCHAR(300)
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Default p_date to current date if null
+    IF p_date IS NULL THEN
+        p_date := CURRENT_DATE;
+    ELSE
+        p_date := p_date::DATE;
+    END IF;
+
+    -- Return if branchCode is null or empty
+    IF p_branchCode IS NULL OR p_branchCode = '' THEN
+        RETURN;
+    END IF;
+
+    -- START import
+    CREATE TEMP TABLE tempAvg AS
+    SELECT CAST(VISIT_TIME AS DATE) AS "DATE",
+           ORG_CODE, 
+           OPERATOR_CODE, 
+           QUEUE_CODE,
+           FLOOR(AVG(avgSecond)) AS avgSecond, 
+           COUNT(VISIT_TIME) AS "COUNT"
+    FROM (
+        SELECT t.*, 
+               COALESCE(EXTRACT(EPOCH FROM (max_time - min_time)), 0) AS avgSecond
+        FROM (
+            SELECT VISIT_TIME, TICKET_NO, ORG_CODE, SERVICE_STATUS, OPERATOR_CODE,
+                   ROW_NUMBER() OVER (PARTITION BY QUEUE_CODE, ORG_CODE, CAST(VISIT_TIME AS DATE), SERVICE_END_TIME, OPERATOR_CODE
+                                      ORDER BY SERVICE_END_TIME) AS RNK,
+                   TX_SEND_TIME AS min_time,
+                   SERVICE_END_TIME AS max_time,
+                   SERVICE_END_TIME,
+                   QUEUE_CODE,
+                   ORG_CODE AS BRANCH
+            FROM vw_rd_cims_customer_service
+            WHERE TX_SEND_TIME IS NOT NULL
+              AND CAST(VISIT_TIME AS DATE) = p_date::DATE
+        ) t
+        WHERE t.RNK = 1
+    ) t2
+    GROUP BY CAST(VISIT_TIME AS DATE), ORG_CODE, QUEUE_CODE, OPERATOR_CODE;
+
+    -- Select result into temp table
+    CREATE TEMP TABLE tempTable AS
+    SELECT A.DATE,
+           A.ORG_CODE,
+           A.BRANCH_NAME,
+           A.OPERATOR_CODE,
+           A.TOTAL,
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN (
+                'O_CD', 'O_WC', 'O_PB', 'O_DC', 'O_EC', 'O_CCCA', 'O_FT', 'O_FXBS', 'O_MCDDI', 'O_PBMNG', 'O_OT',
+                'CD', 'WC', 'PB', 'DC', 'EC', 'CCCA', 'FT', 'FXBS', 'MCDDI', 'PBMNG', 'OT') 
+            AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Average_Transaction_Speed",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('CD', 'O_CD') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Cash_Deposit",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('WC', 'O_WC') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Cash_Withdrawal",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('PB', 'O_PB') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Bills_Payment",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('DC', 'O_DC') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Check_Deposit",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('EC', 'O_EC') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Check_Encashment",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('CCCA', 'O_CCCA') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Credit_Card_Cash_Advance",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('FT', 'O_FT') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Fund_Transfer",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('FXBS', 'O_FXBS') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "FX_Buy_and_Sell",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('MCDDI', 'O_MCDDI') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "MCDD_issuance",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('PBMNG', 'O_PBMNG') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Passbook_Management",
+           (SELECT TO_CHAR(TO_TIMESTAMP(AVG(CAST(avgSecond AS BIGINT))), 'HH24:MI:SS') 
+            FROM tempAvg B 
+            WHERE B.QUEUE_CODE IN ('OT', 'O_OT') 
+              AND B.DATE = A.DATE AND B.ORG_CODE = A.ORG_CODE AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS "Other_Teller_Transactions"
+    FROM (
+        SELECT CAST(VISIT_TIME AS DATE) AS "DATE",
+               ORG_CODE,
+               BRANCH_NAME,
+               OPERATOR_CODE,
+               COUNT(*) AS "TOTAL"
+        FROM vw_rd_cims_customer_service
+        WHERE TX_SEND_TIME IS NOT NULL
+          AND CAST(VISIT_TIME AS DATE) = p_date::DATE
+        GROUP BY CAST(VISIT_TIME AS DATE), ORG_CODE, BRANCH_NAME, OPERATOR_CODE
+    ) A;
+
+    -- Further processing based on report name
+    IF p_reportName = 'average_transaction_time_per_branch_report' THEN
+        CREATE TEMP TABLE TEMPAVG_RPT AS
+        SELECT * FROM tempTable
+        WHERE (p_branchCode IS NULL OR p_branchCode = '' OR ORG_CODE = p_branchCode)
+          AND CAST(DATE AS DATE) = p_date::DATE;
+
+        -- Add logic for processing average transaction speeds by queue type here...
+
+        -- Drop temp table
+        DROP TABLE TEMPAVG_RPT;
+    ELSIF p_reportName = 'Processor_Transaction_Speed_Report' THEN
+        -- Output the table based on report name conditions
+        PERFORM * FROM tempTable
+        WHERE CAST(DATE AS DATE) = p_date::DATE
+          AND (p_branchCode IS NULL OR p_branchCode = '' OR ORG_CODE = p_branchCode);
+    END IF;
+
+    -- Drop temporary tables
+    DROP TABLE tempAvg;
+    DROP TABLE tempTable;
+
+END;
+$$;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CREATE PROCEDURE SP_DW_QUEUE_TRX_DETAIL_TEMP(
+    IN date_param DATE,
+    IN branchCode VARCHAR(100),
+    IN reportName VARCHAR(300)
+)
+LANGUAGE plpgsql AS
+$$
+BEGIN
+    -- If date_param is null, set it to current date
+    IF date_param IS NULL THEN
+        date_param := CURRENT_DATE;
+    END IF;
+
+    -- Create temporary table tmpView
+    CREATE TEMP TABLE tmpView AS
+    SELECT
+        CAST(visit_time AS DATE) AS visit_date,
+        CASE WHEN service_status IN ('3', '5') THEN 'Served' ELSE 'Not Served' END AS status,
+        org_code AS branch_code,
+        description AS transaction_type,
+        ticket_no AS queue_number,
+        operator_code AS processed_by,
+        MIN(visit_time) AS date_time,
+        MIN(service_start_time) AS pick_up_time,
+        MAX(service_end_time) AS posting_time,
+        LPAD(CAST(EXTRACT(HOUR FROM AGE(MAX(service_end_time), MIN(service_start_time))) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(MINUTE FROM AGE(MAX(service_end_time), MIN(service_start_time))) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(SECOND FROM AGE(MAX(service_end_time), MIN(service_start_time))) AS TEXT), 2, '0') AS transaction_speed,
+        branch_name,
+        remarks2 AS transaction_details,
+        remarks3 AS transaction_sequence,
+        (SELECT description FROM cims_picklist WHERE category = 'Segment' AND code = a.tran_segment) AS segment,
+        tran_account_no AS account_no,
+        b.mvactp AS customer_type,
+        transfer_counter_no AS transferred_to,
+        queue_start_time,
+        LPAD(CAST(EXTRACT(HOUR FROM AGE(MIN(visit_time), queue_start_time)) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(MINUTE FROM AGE(MIN(visit_time), queue_start_time)) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(SECOND FROM AGE(MIN(visit_time), queue_start_time)) AS TEXT), 2, '0') AS total_time_spent_in_the_queue,
+        LPAD(CAST(EXTRACT(HOUR FROM AGE(MIN(service_start_time), MIN(visit_time))) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(MINUTE FROM AGE(MIN(service_start_time), MIN(visit_time))) AS TEXT), 2, '0') || ':' ||
+        LPAD(CAST(EXTRACT(SECOND FROM AGE(MIN(service_start_time), MIN(visit_time))) AS TEXT), 2, '0') AS total_waiting_time,
+        counter_code,
+        is_client,
+        is_special,
+        service_status
+    FROM vw_rd_cims_customer_service a
+    LEFT JOIN mvdb_sbc_nts_eq.dbo.account_dload b ON b.mvaean = a.tran_account_no
+    WHERE CAST(visit_time AS DATE) = date_param
+    GROUP BY visit_time, service_status, org_code, description, ticket_no, operator_code, branch_name, remarks2, remarks3, tran_segment, tran_account_no, customer_info, b.mvactp, transfer_counter_no, queue_start_time, counter_code, is_client, is_special, service_status;
+
+    -- Create tempResult table
+    CREATE TEMP TABLE tempResult AS
+    SELECT 
+        currentQ.visit_date, currentQ.status, currentQ.branch_code, currentQ.transaction_type, currentQ.queue_number,
+        currentQ.processed_by, currentQ.date_time, currentQ.pick_up_time, currentQ.posting_time, currentQ.transaction_speed,
+        currentQ.branch_name, currentQ.transaction_details, currentQ.transaction_sequence, currentQ.segment, currentQ.account_no,
+        currentQ.customer_type, currentQ.transferred_to, nextQGrp.next_queue_number, nextQGrp.next_pick_up_time, nextQGrp.next_posting_time,
+        CASE WHEN nextQGrp.next_queue_number IS NULL THEN NULL ELSE
+            LPAD(CAST(EXTRACT(HOUR FROM AGE(nextQGrp.next_pick_up_time, currentQGrp.final_posting_time)) AS TEXT), 2, '0') || ':' ||
+            LPAD(CAST(EXTRACT(MINUTE FROM AGE(nextQGrp.next_pick_up_time, currentQGrp.final_posting_time)) AS TEXT), 2, '0') || ':' ||
+            LPAD(CAST(EXTRACT(SECOND FROM AGE(nextQGrp.next_pick_up_time, currentQGrp.final_posting_time)) AS TEXT), 2, '0') END AS idle_time,
+        currentQ.queue_start_time, currentQ.total_time_spent_in_the_queue, currentQ.total_waiting_time, currentQ.counter_code, currentQ.is_client,
+        currentQ.is_special, currentQ.service_status
+    FROM tmpView currentQ
+    INNER JOIN (
+        SELECT branch_code, processed_by, queue_number, MAX(posting_time) AS final_posting_time
+        FROM tmpView
+        GROUP BY branch_code, processed_by, queue_number
+    ) currentQGrp ON currentQ.branch_code = currentQGrp.branch_code AND COALESCE(currentQ.processed_by, '') = COALESCE(currentQGrp.processed_by, '')
+    LEFT JOIN (
+        SELECT a.branch_code, a.processed_by, a.queue_number, MIN(b.next_pick_up_time) AS next_pick_up_time
+        FROM (
+            SELECT branch_code, processed_by, queue_number, MAX(posting_time) AS final_posting_time
+            FROM tmpView
+            GROUP BY branch_code, processed_by, queue_number
+        ) a
+        LEFT JOIN (
+            SELECT branch_code, processed_by, MIN(pick_up_time) AS next_pick_up_time
+            FROM tmpView
+            GROUP BY branch_code, processed_by, queue_number
+        ) b ON a.branch_code = b.branch_code AND COALESCE(a.processed_by, '') = COALESCE(b.processed_by, '') AND a.final_posting_time <= b.next_pick_up_time
+        GROUP BY a.branch_code, a.processed_by, a.queue_number
+    ) currentNextQGrp ON currentQ.branch_code = currentNextQGrp.branch_code AND COALESCE(currentQ.processed_by, '') = COALESCE(currentNextQGrp.processed_by, '')
+    LEFT JOIN (
+        SELECT branch_code, processed_by, queue_number AS next_queue_number, MIN(pick_up_time) AS next_pick_up_time, MAX(posting_time) AS next_posting_time
+        FROM tmpView
+        GROUP BY branch_code, processed_by, queue_number
+    ) nextQGrp ON currentQ.branch_code = nextQGrp.branch_code AND COALESCE(currentQ.processed_by, '') = COALESCE(nextQGrp.processed_by, '');
+
+    -- Prepare to insert into a results table based on the reportName
+    IF reportName = 'transaction_summary_per_branch_report' THEN
+        INSERT INTO tempResult (visit_date, branch_code, branch_name, counter_code, queue_number, transaction_type, date_time, pick_up_time, total_waiting_time, posting_time, transaction_speed, transfer_service, service_status)
+        SELECT
+            visit_date,
+            branch_code,
+            branch_name,
+            counter_code,
+            queue_number,
+            transaction_type,
+            date_time,
+            pick_up_time,
+            total_waiting_time,
+            posting_time,
+            transaction_speed,
+            CASE WHEN service_status = '5' THEN 1 ELSE 0 END,
+            status
+        FROM tempResult
+        WHERE CAST(date_time AS DATE) = date_param
+        AND (branchCode IS NULL OR branch_code = branchCode);
+    ELSIF reportName = 'Processor_Utilization_Report' THEN
+        INSERT INTO tempResult 
+        SELECT * FROM tempResult
+        WHERE CAST(date_time AS DATE) = date_param
+        AND (branchCode IS NULL OR branch_code = branchCode);
+    ELSIF reportName = 'Service_Metric_Report' THEN
+        INSERT INTO tempResult
+        SELECT
+            date_time,
+            branch_code,
+            branch_name,
+            is_client AS sbc_client,
+            segment AS customer_segment,
+            is_special AS senior_citizen_pwd_pregnant,
+            transaction_type,
+            account_no,
+            queue_number,
+            queue_start_time,
+            date_time AS end_time_at_queue_machine,
+            CAST(total_time_spent_in_the_queue AS interval) AS total_time_in_queue_display,
+            pick_up_time,
+            processed_by,
+            CAST(total_waiting_time AS interval) AS total_waiting_time_display,
+            posting_time,
+            transaction_speed,
+            CASE WHEN service_status IN ('3', '5') THEN 'Served' WHEN service_status = '4' THEN 'Skipped' ELSE 'Not Served' END AS status
+        FROM tempResult
+        WHERE CAST(date_time AS DATE) = date_param
+        AND (branchCode IS NULL OR branch_code = branchCode);
+    ELSIF reportName = 'Transaction_Speed_Report' THEN
+        INSERT INTO tempResult 
+        SELECT * FROM tempResult
+        WHERE CAST(date_time AS DATE) = date_param
+        AND (branchCode IS NULL OR branch_code = branchCode);
+    ELSE
+        RAISE EXCEPTION 'Invalid report name: %', reportName;
+    END IF;
+
+    -- Output final results
+    RAISE NOTICE 'Results prepared, you can query tempResult table now.';
+
+END;
+$$;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CREATE PROCEDURE SP_IMPORT_DW_PROC_TRX_SPD(INOUT date_param TIMESTAMP(3))
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    v_date DATE;
+BEGIN
+    IF date_param IS NULL THEN
+        v_date := CURRENT_DATE;
+    ELSE
+        v_date := date_param;
+    END IF;
+
+    -- Check if v_date already exists in the table
+    IF EXISTS (SELECT 1 FROM DW_PROC_TRX_SPD WHERE DATE = v_date) THEN
+        RETURN; -- stop here 
+    END IF;
+
+    -- START import
+    CREATE TEMP TABLE tempAvg AS
+    SELECT a.*
+    FROM (
+        SELECT CAST(VISIT_TIME AS DATE) AS DATE,
+               ORG_CODE,
+               OPERATOR_CODE,
+               QUEUE_CODE,
+               FLOOR(AVG(avgSecond)) AS avgSecond,
+               COUNT(VISIT_TIME) AS COUNT
+        FROM (
+            SELECT t.*, COALESCE(EXTRACT(EPOCH FROM (max_time - min_time)), 0) AS avgSecond
+            FROM (
+                SELECT VISIT_TIME,
+                       TICKET_NO,
+                       ORG_CODE,
+                       SERVICE_STATUS,
+                       OPERATOR_CODE,
+                       ROW_NUMBER() OVER (PARTITION BY QUEUE_CODE, ORG_CODE, CAST(VISIT_TIME AS DATE), service_end_time, OPERATOR_CODE ORDER BY SERVICE_END_TIME) AS RNK,
+                       TX_SEND_TIME AS min_time,
+                       SERVICE_END_TIME AS max_time,
+                       QUEUE_CODE,
+                       ORG_CODE AS BRANCH
+                FROM vw_rd_cims_customer_service
+                WHERE TX_SEND_TIME IS NOT NULL
+                  AND CAST(VISIT_TIME AS DATE) = v_date
+            ) t
+            WHERE RNK = 1
+        ) t2
+        GROUP BY CAST(VISIT_TIME AS DATE), ORG_CODE, QUEUE_CODE, OPERATOR_CODE
+    ) a;
+
+    INSERT INTO DW_PROC_TRX_SPD (
+        DATE,
+        ORG_CODE,
+        BRANCH_NAME,
+        OPERATOR_CODE,
+        TOTAL,
+        Average_Transaction_Speed,
+        Cash_Deposit,
+        Cash_Withdrawal,
+        Bills_Payment,
+        Check_Deposit,
+        Check_Encashment,
+        Credit_Card_Cash_Advance,
+        Fund_Transfer,
+        FX_Buy_and_Sell,
+        MCDD_issuance,
+        Passbook_Management,
+        Other_Teller_Transactions
+    )
+    SELECT RESULT.*
+    FROM (
+        SELECT A.DATE,
+               A.ORG_CODE,
+               A.BRANCH_NAME,
+               A.OPERATOR_CODE,
+               A.TOTAL,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('O_CD','O_WC','O_PB','O_DC','O_EC','O_CCCA','O_FT','O_FXBS','O_MCDDI','O_PBMNG','O_OT',
+                                       'CD','WC','PB','DC','EC','CCCA','FT','FXBS','MCDDI','PBMNG','OT')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Average_Transaction_Speed,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('CD','O_CD')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Cash_Deposit,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('WC','O_WC')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Cash_Withdrawal,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('PB','O_PB')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Bills_Payment,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('DC','O_DC')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Check_Deposit,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('EC','O_EC')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Check_Encashment,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('CCCA','O_CCCA')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Credit_Card_Cash_Advance,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('FT','O_FT')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Fund_Transfer,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('FXBS','O_FXBS')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS FX_Buy_and_Sell,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('MCDDI','O_MCDDI')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS MCDD_issuance,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('PBMNG','O_PBMNG')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Passbook_Management,
+               (SELECT TO_CHAR(TO_TIMESTAMP(AVG(avgSecond), 'epoch'), 'HH24:MI:SS')
+                FROM tempAvg B
+                WHERE B.QUEUE_CODE IN ('OT','O_OT')
+                  AND B.DATE = A.DATE
+                  AND B.ORG_CODE = A.ORG_CODE
+                  AND B.OPERATOR_CODE = A.OPERATOR_CODE) AS Other_Teller_Transactions
+        FROM (
+            SELECT CAST(VISIT_TIME AS DATE) AS DATE,
+                   ORG_CODE,
+                   BRANCH_NAME,
+                   OPERATOR_CODE,
+                   COUNT(*) AS TOTAL
+            FROM vw_rd_cims_customer_service
+            WHERE TX_SEND_TIME IS NOT NULL
+              AND CAST(VISIT_TIME AS DATE) = v_date
+            GROUP BY CAST(VISIT_TIME AS DATE), ORG_CODE, BRANCH_NAME, OPERATOR_CODE
+        ) A
+    ) RESULT;
+
+    DROP TABLE tempAvg;
+
+END;
+$$;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- SP_IMPORT_DW_QUEUE_TRX_DETAIL
+-- Purpose: transfer data to table for report inquiries
+-- Notes:
+-- - General report parameters: 
+-- - From and To Date refer to [VISIT_DATE],
+-- - Branch Code refer to [BRANCH_CODE]
+
+
+CREATE PROCEDURE SP_IMPORT_DW_QUEUE_TRX_DETAIL(p_date  TIMESTAMP(3))
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Set current date if input date is NULL
+    IF p_date  IS NULL THEN
+        p_date  := CAST(NOW() as DATE);
+    ELSE
+        p_date  := CAST(p_date as DATE);
+    END IF;
+
+    -- Check if the date already exists in the table
+    IF EXISTS (SELECT 1 FROM DW_QUEUE_TRX_DETAIL WHERE VISIT_DATE = p_date) THEN
+        RETURN; -- Stop execution if the date already exists
+
+    -- Start import into a temporary table
+create temporary table tmpView as
+select
+ CAST(VISIT_TIME as DATE) AS VISIT_DATE,
+ CASE WHEN SERVICE_STATUS IN ('3','5') THEN 'Served' ELSE 'Not Served' END AS STATUS, 
+ org_code as BRANCH_CODE,
+ DESCRIPTION AS TRANSACTION_TYPE,
+ Ticket_no As QUEUE_NUMBER, 
+ OPERATOR_CODE AS PROCESSED_BY,
+ min(VISIT_TIME) AS DATE,
+ min(SERVICE_START_TIME) AS PICK_UP_TIME,
+ MAX(SERVICE_END_TIME) AS POSTING_TIME,
+ Concat(CONCAT(REPLICATE('0',2-LENGTH(RTRIM(( floor(DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME))/60/60))))),(floor(DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME))/60/60))),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME))/60)%60, 0,-1))))),Round((DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME))/60)%60, 0,-1)),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME)))%60, 0,-1))))),Round((DATEDIFF(S,min(SERVICE_START_TIME),max(SERVICE_END_TIME)))%60, 0,-1))) AS TRANSACTION_SPEED,
+	BRANCH_NAME,
+ REMARKS2 AS TRANSACTION_DETAILS,
+ REMARKS3 AS TRANSACTION_SEQUENCE,
+ (select DESCRIPTION from CIMS_PICKLIST where CATEGORY = 'Segment' and code = a.TRAN_SEGMENT),
+ a.TRAN_ACCOUNT_NO AS ACCOUNT_NO,
+ b.MVACTP AS CUSTOMER_TYPE,
+ TRANSFER_COUNTER_NO AS TRANSFERRED_TO,
+	QUEUE_START_TIME,
+ Concat(CONCAT(REPLICATE('0',2-LENGTH(RTRIM(( floor(DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3)))/60/60))))),(floor(DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3)))/60/60))),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3)))/60)%60, 0,-1))))),Round((DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3)))/60)%60, 0,-1)),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3))))%60, 0,-1))))),Round((DATEDIFF(S,QUEUE_START_TIME,CAST(min(VISIT_TIME) AS timestamp(3))))%60, 0,-1))) AS TOTAL_TIME_SPENT_IN_THE_QUEUE,
+ Concat(CONCAT(REPLICATE('0',2-LENGTH(RTRIM(( floor(DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME))/60/60))))),(floor(DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME))/60/60))),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME))/60)%60, 0,-1))))),Round((DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME))/60)%60, 0,-1)),
+		':',concat(REPLICATE('0', 2 - LENGTH(RTRIM(( Round((DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME)))%60, 0,-1))))),Round((DATEDIFF(S,min(VISIT_TIME),min(SERVICE_START_TIME)))%60, 0,-1))) AS TOTAL_WAITING_TIME ,
+	COUNTER_CODE,
+	IS_CLIENT,
+	IS_SPECIAL,
+	SERVICE_STATUS
+from vw_rd_cims_customer_service a left join MVDB_SBC_NTS_EQ.ACCOUNT_DLOAD b on b.MVAEAN /* COLLATE SQL_Latin1_General_CP1_CI_AS */ = a.TRAN_ACCOUNT_NO
+where CAST(VISIT_TIME as DATE) = p_date
+GROUP BY 
+	CAST(VISIT_TIME as DATE), SERVICE_STATUS, Org_code, DESCRIPTION, Ticket_no, 
+	OPERATOR_CODE, BRANCH_NAME, REMARKS2, REMARKS3, TRAN_SEGMENT, 
+	TRAN_ACCOUNT_NO, customer_info, b.MVACTP, TRANSFER_COUNTER_NO, QUEUE_START_TIME, COUNTER_CODE,
+	IS_CLIENT, IS_SPECIAL, SERVICE_STATUS;
+end if;
+
+INSERT INTO DW_QUEUE_TRX_DETAIL (VISIT_DATE, STATUS, BRANCH_CODE, TRANSACTION_TYPE, QUEUE_NUMBER, 
+	PROCESSED_BY, DATE, PICK_UP_TIME, POSTING_TIME, TRANSACTION_SPEED, 
+	BRANCH_NAME, TRANSACTION_DETAILS, TRANSACTION_SEQUENCE, SEGMENT, ACCOUNT_NO, 
+	CUSTOMER_TYPE, TRANSFERRED_TO, 
+	NEXT_QUEUE_NUMBER, NEXT_PICK_UP_TIME, NEXT_POSTING_TIME, IDLE_TIME,
+	QUEUE_START_TIME, TOTAL_TIME_SPENT_IN_THE_QUEUE, TOTAL_WAITING_TIME, 
+	COUNTER_CODE, IS_CLIENT, IS_SPECIAL, SERVICE_STATUS)
+SELECT currentQ.VISIT_DATE, currentQ.STATUS, currentQ.BRANCH_CODE, currentQ.TRANSACTION_TYPE, currentQ.QUEUE_NUMBER, 
+	currentQ.PROCESSED_BY, currentQ.DATE, currentQ.PICK_UP_TIME, currentQ.POSTING_TIME , currentQ.TRANSACTION_SPEED, 
+	currentQ.BRANCH_NAME, currentQ.TRANSACTION_DETAILS, currentQ.TRANSACTION_SEQUENCE, currentQ.SEGMENT, currentQ.ACCOUNT_NO, 
+	currentQ.CUSTOMER_TYPE, currentQ.TRANSFERRED_TO, 
+	nextQGrp.NEXT_QUEUE_NUMBER, nextQGrp.NEXT_PICK_UP_TIME, nextQGrp.NEXT_POSTING_TIME,
+  case when nextQGrp.NEXT_QUEUE_NUMBER is null then null 
+		else  Concat(
+		 -- HH
+		CONCAT(
+			REPLICATE('0', 2 - LENGTH(RTRIM(floor(DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME)/60/60)))), 
+			floor(DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME)/60/60)
+			),
+		-- mm
+		':', concat(
+			REPLICATE('0', 2 - LENGTH(RTRIM(Round((DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME)/60)%60, 0, -1)))), 
+			Round((DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME)/60)%60, 0,-1)
+			),
+		-- ss
+		':',concat(
+			REPLICATE('0', 2 - LENGTH(RTRIM(Round((DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME))%60, 0,-1)))), 
+			Round((DATEDIFF(S, currentQGrp.FINAL_POSTING_TIME, nextQGrp.NEXT_PICK_UP_TIME))%60, 0,-1)
+			)
+		) end as IDLE_TIME,
+	currentQ.QUEUE_START_TIME, currentQ.TOTAL_TIME_SPENT_IN_THE_QUEUE, currentQ.TOTAL_WAITING_TIME, 
+	currentQ.COUNTER_CODE, currentQ.IS_CLIENT, currentQ.IS_SPECIAL, currentQ.SERVICE_STATUS
+FROM tmpView currentQ
+inner join (
+	select BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER, MAX(POSTING_TIME) AS FINAL_POSTING_TIME 
+	from tmpView
+	group by BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER
+	) currentQGrp 
+	on currentQ.BRANCH_CODE = currentQGrp.BRANCH_CODE and coalesce(currentQ.PROCESSED_BY, '') = coalesce(currentQGrp.PROCESSED_BY, '')
+		and currentQ.QUEUE_NUMBER = currentQGrp.QUEUE_NUMBER
+left join (
+	select a.BRANCH_CODE, a.PROCESSED_BY, a.QUEUE_NUMBER, min(b.NEXT_PICK_UP_TIME) AS NEXT_PICK_UP_TIME
+	from (
+		select BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER, MAX(POSTING_TIME) AS FINAL_POSTING_TIME 
+		from tmpView
+		group by BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER
+		) a
+	left join (
+		select BRANCH_CODE, PROCESSED_BY, min(PICK_UP_TIME) AS NEXT_PICK_UP_TIME
+		from tmpView
+		group by BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER
+		) b on a.BRANCH_CODE = b.BRANCH_CODE and coalesce(a.PROCESSED_BY, '') = coalesce(b.PROCESSED_BY, '')
+			and a.FINAL_POSTING_TIME <= b.NEXT_PICK_UP_TIME
+	group by a.BRANCH_CODE, a.PROCESSED_BY, a.QUEUE_NUMBER
+	) currentNextQGrp 
+	on currentQ.BRANCH_CODE = currentNextQGrp.BRANCH_CODE and coalesce(currentQ.PROCESSED_BY, '') = coalesce(currentNextQGrp.PROCESSED_BY, '')
+		and currentQ.QUEUE_NUMBER = currentNextQGrp.QUEUE_NUMBER
+left join (
+	select BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER AS NEXT_QUEUE_NUMBER, 
+ min(PICK_UP_TIME) AS NEXT_PICK_UP_TIME, MAX(POSTING_TIME) AS NEXT_POSTING_TIME, null as IDLE_TIME
+	from tmpView
+	group by BRANCH_CODE, PROCESSED_BY, QUEUE_NUMBER
+	) nextQGrp 
+	on currentQ.BRANCH_CODE = nextQGrp.BRANCH_CODE and coalesce(currentQ.PROCESSED_BY, '') = coalesce(nextQGrp.PROCESSED_BY, '')
+		and currentNextQGrp.NEXT_PICK_UP_TIME = nextQGrp.NEXT_PICK_UP_TIME;
+
+    drop table tmpView;
+
+END;
+$$;
+
+
+
